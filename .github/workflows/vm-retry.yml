@@ -1,0 +1,35 @@
+name: Tentar subir a VM
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: vm-retry
+  cancel-in-progress: false
+
+jobs:
+  retry-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar OCI
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          STACK_OCID: ${{ secrets.STACK_OCID }}
+        run: |
+          echo "Configuração carregada"
+
+      - name: Verificar status da VM
+        run: |
+          # aqui entra a lógica de consulta
+
+      - name: Repetir APPLY se necessário
+        run: |
+          # aqui entra a lógica de retry
