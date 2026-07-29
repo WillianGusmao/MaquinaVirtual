@@ -12,8 +12,15 @@ concurrency:
 jobs:
   retry-vm:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar OCI CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install oci-cli
 
       - name: Configurar OCI
         env:
@@ -22,14 +29,56 @@ jobs:
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          mkdir -p ~/.oci
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
+
+      - name: Verificar se a VM já está ativa
+        env:
+          COMPARTMENT_OCID: ${{ secrets.COMPARTMENT_OCID }}
+          VM_DISPLAY_NAME: ${{ secrets.VM_DISPLAY_NAME }}
+        run: |
+          echo "Verificando instâncias no compartment..."
+          oci compute instance list \
+            --compartment-id "$COMPARTMENT_OCID" \
+            --all \
+            --query "data[?\"display-name\"=='$VM_DISPLAY_NAME'].{name:\"display-name\", state:\"lifecycle-state\", id:id}" \
+            --output table
+
+          STATE=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_OCID" \
+            --all \
+            --query "data[?\"display-name\"=='$VM_DISPLAY_NAME'] | [0].\"lifecycle-state\"" \
+            --raw-output 2>/dev/null || true)
+
+          if [ "$STATE" = "RUNNING" ]; then
+            echo "A VM já está RUNNING. Nada a fazer."
+            exit 0
+          fi
+
+          echo "A VM ainda não está RUNNING. Vou tentar aplicar o stack."
+
+      - name: Disparar APPLY do stack
+        env:
           STACK_OCID: ${{ secrets.STACK_OCID }}
         run: |
-          echo "Configuração carregada"
+          JOB_ID=$(oci resource-manager job create-apply-job \
+            --stack-id "$STACK_OCID" \
+            --display-name "retry-vm-$(date +%Y%m%d-%H%M%S)" \
+            --operation APPLY \
+            --wait-for-state SUCCEEDED \
+            --query "data.id" \
+            --raw-output)
 
-      - name: Verificar status da VM
-        run: |
-          # aqui entra a lógica de consulta
-
-      - name: Repetir APPLY se necessário
-        run: |
-          # aqui entra a lógica de retry
+          echo "Job disparado: $JOB_ID"
