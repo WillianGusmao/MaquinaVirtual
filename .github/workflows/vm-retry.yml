@@ -36,7 +36,7 @@ jobs:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_PRIVATE_KEY_B64: ${{ secrets.OCI_PRIVATE_KEY_B64 }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
         run: |
           set -euo pipefail
@@ -52,16 +52,42 @@ jobs:
           key_file=~/.oci/oci_api_key.pem
           EOF
 
-          # Aceita private key salva com \n ou com quebras reais
-          printf '%b' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          # Verifica presença do secret base64
+          if [ -z "${OCI_PRIVATE_KEY_B64:-}" ]; then
+            echo "::error::Secret OCI_PRIVATE_KEY_B64 não encontrado. Crie-o com base64 -w0 oci_api_key.pem"
+            exit 1
+          fi
 
+          # Decodifica private key a partir do secret base64
+          echo "$OCI_PRIVATE_KEY_B64" | base64 --decode > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
 
-          # Validação básica da chave
+          # Validação básica do formato PEM
           if ! head -n 1 ~/.oci/oci_api_key.pem | grep -Eq 'BEGIN .*PRIVATE KEY'; then
             echo "::error::A private key não parece estar em formato PEM válido."
             exit 1
           fi
+
+          # Calcula fingerprint (formato aa:bb:cc:...) e compara com o secret
+          KEY_FP=$(openssl rsa -in ~/.oci/oci_api_key.pem -pubout -outform DER | openssl md5 -c | awk '{print $2}')
+          if [ "$KEY_FP" != "${OCI_FINGERPRINT}" ]; then
+            echo "::error::Fingerprint da private key ($KEY_FP) não corresponde a OCI_FINGERPRINT (${OCI_FINGERPRINT})."
+            exit 1
+          fi
+
+          # Teste rápido de autenticação OCI (falha cedo com saída mínima)
+          set +e
+          oci iam user get --user-id "$OCI_USER_OCID" --query "data.id" --raw-output >/dev/null 2>oci_auth_debug
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Falha de autenticação OCI (status=$STATUS). Verifique OCI_USER_OCID, tenancy e API key."
+            echo "Saída de debug (sanitizada):"
+            sed -n '1,200p' oci_auth_debug || true
+            exit 1
+          fi
+
+          echo "Configuração OCI OK."
 
       - name: Verificar se a VM já está ativa
         id: vm_check
