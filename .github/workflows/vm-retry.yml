@@ -5,17 +5,24 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: vm-retry
   cancel-in-progress: false
 
+env:
+  SUPPRESS_LABEL_WARNING: "True"
+
 jobs:
   retry-vm:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout do repositório
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Instalar OCI CLI e jq
         run: |
@@ -32,7 +39,10 @@ jobs:
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.oci
+
           cat > ~/.oci/config <<EOF
           [DEFAULT]
           user=${OCI_USER_OCID}
@@ -41,88 +51,139 @@ jobs:
           region=${OCI_REGION}
           key_file=~/.oci/oci_api_key.pem
           EOF
-          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+
+          # Aceita private key salva com \n ou com quebras reais
+          printf '%b' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+
           chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
 
-      - name: Analisar se deve reenfileirar o apply
-        id: decision
+          # Validação básica da chave
+          if ! head -n 1 ~/.oci/oci_api_key.pem | grep -Eq 'BEGIN .*PRIVATE KEY'; then
+            echo "::error::A private key não parece estar em formato PEM válido."
+            exit 1
+          fi
+
+      - name: Verificar se a VM já está ativa
+        id: vm_check
         env:
           COMPARTMENT_OCID: ${{ secrets.COMPARTMENT_OCID }}
           VM_DISPLAY_NAME: ${{ secrets.VM_DISPLAY_NAME }}
-          STACK_OCID: ${{ secrets.STACK_OCID }}
         run: |
           set -euo pipefail
 
-          SHOULD_APPLY="false"
-          REASON=""
+          echo "Verificando instâncias no compartment..."
 
-          echo "Verificando se a VM já está RUNNING..."
-          STATE=$(oci compute instance list \
+          INSTANCE_JSON=$(oci compute instance list \
             --compartment-id "$COMPARTMENT_OCID" \
             --all \
-            --query "data[?\"display-name\"=='$VM_DISPLAY_NAME'] | [0].\"lifecycle-state\"" \
-            --raw-output 2>/dev/null || true)
+            --output json)
 
-          if [ "$STATE" = "RUNNING" ]; then
+          STATE=$(echo "$INSTANCE_JSON" | jq -r \
+            --arg NAME "$VM_DISPLAY_NAME" \
+            '.data[]
+             | select(."display-name" == $NAME)
+             | ."lifecycle-state"
+             ' | head -n 1)
+
+          if [ "${STATE:-}" = "RUNNING" ]; then
             echo "A VM já está RUNNING. Nada a fazer."
             echo "should_apply=false" >> "$GITHUB_OUTPUT"
             echo "reason=vm_running" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "A VM ainda não está RUNNING. Verificando jobs da stack..."
+          echo "A VM ainda não está RUNNING."
+          echo "should_apply=check_jobs" >> "$GITHUB_OUTPUT"
+          echo "reason=vm_not_running" >> "$GITHUB_OUTPUT"
 
+      - name: Analisar último job da stack
+        id: decision
+        if: steps.vm_check.outputs.should_apply == 'check_jobs'
+        env:
+          STACK_OCID: ${{ secrets.STACK_OCID }}
+        run: |
+          set -euo pipefail
+
+          echo "Verificando jobs da stack..."
+
+          set +e
           JOBS_JSON=$(oci resource-manager job list \
             --stack-id "$STACK_OCID" \
             --all \
-            --output json)
+            --output json 2>&1)
+          STATUS=$?
+          set -e
 
-          LAST_JOB_ID=$(echo "$JOBS_JSON" | jq -r '.data | sort_by(."time-created") | last.id // empty')
-          LAST_JOB_STATE=$(echo "$JOBS_JSON" | jq -r '.data | sort_by(."time-created") | last."lifecycle-state" // empty')
+          if [ "$STATUS" -ne 0 ]; then
+            echo "$JOBS_JSON"
+            echo "::error::Falha ao listar jobs da stack."
+            exit 1
+          fi
+
+          LAST_JOB_ID=$(echo "$JOBS_JSON" | jq -r '
+            .data
+            | sort_by(."time-created")
+            | if length > 0 then last.id else "" end
+          ')
+
+          LAST_JOB_STATE=$(echo "$JOBS_JSON" | jq -r '
+            .data
+            | sort_by(."time-created")
+            | if length > 0 then last."lifecycle-state" else "" end
+          ')
 
           if [ -z "$LAST_JOB_ID" ]; then
             echo "Nenhum job anterior encontrado. Vou disparar o APPLY."
-            SHOULD_APPLY="true"
-            REASON="no_previous_job"
-          else
-            echo "Último job: $LAST_JOB_ID"
-            echo "Estado do último job: $LAST_JOB_STATE"
+            echo "should_apply=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no_previous_job" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-            if [ "$LAST_JOB_STATE" = "SUCCEEDED" ]; then
+          echo "Último job: $LAST_JOB_ID"
+          echo "Estado do último job: $LAST_JOB_STATE"
+
+          case "$LAST_JOB_STATE" in
+            SUCCEEDED)
               echo "O último apply já foi concluído com sucesso."
               echo "should_apply=false" >> "$GITHUB_OUTPUT"
               echo "reason=last_job_succeeded" >> "$GITHUB_OUTPUT"
               exit 0
-            fi
-
-            if [ "$LAST_JOB_STATE" = "ACCEPTED" ] || \
-               [ "$LAST_JOB_STATE" = "IN_PROGRESS" ] || \
-               [ "$LAST_JOB_STATE" = "RUNNING" ]; then
-              echo "Já existe um apply em andamento. Não vou disparar outro."
+              ;;
+            ACCEPTED|IN_PROGRESS|CANCELING)
+              echo "Já existe um job em andamento. Não vou disparar outro."
               echo "should_apply=false" >> "$GITHUB_OUTPUT"
               echo "reason=job_in_progress" >> "$GITHUB_OUTPUT"
               exit 0
-            fi
+              ;;
+          esac
 
-            echo "Buscando detalhes do último job..."
-            JOB_DETAILS=$(oci resource-manager job get \
-              --job-id "$LAST_JOB_ID" \
-              --output json || true)
+          echo "Buscando detalhes do último job..."
+          set +e
+          JOB_DETAILS=$(oci resource-manager job get \
+            --job-id "$LAST_JOB_ID" \
+            --output json 2>&1)
+          STATUS=$?
+          set -e
 
-            if echo "$JOB_DETAILS" | grep -Ei '(OutOfHostCapacity|out of host capacity|No capacity|insufficient capacity|capacity|sem capacidade|sem espaço|insufficient resources)' >/dev/null; then
-              echo "Falha por capacidade detectada. Vou reenfileirar o APPLY."
-              SHOULD_APPLY="true"
-              REASON="capacity_failure"
-            else
-              echo "O último job falhou por outro motivo. Não vou reenfileirar automaticamente."
-              echo "should_apply=false" >> "$GITHUB_OUTPUT"
-              echo "reason=non_capacity_failure" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
+          if [ "$STATUS" -ne 0 ]; then
+            echo "$JOB_DETAILS"
+            echo "::error::Falha ao obter detalhes do último job."
+            exit 1
           fi
 
-          echo "should_apply=$SHOULD_APPLY" >> "$GITHUB_OUTPUT"
-          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          if echo "$JOB_DETAILS" | grep -Ei \
+            '(OutOfHostCapacity|out of host capacity|No capacity|insufficient capacity|capacity|sem capacidade|sem espaço|insufficient resources|host capacity)' >/dev/null; then
+            echo "Falha por capacidade detectada. Vou reenfileirar o APPLY."
+            echo "should_apply=true" >> "$GITHUB_OUTPUT"
+            echo "reason=capacity_failure" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "O último job falhou por outro motivo."
+          echo "Não vou reenfileirar automaticamente."
+          echo "should_apply=false" >> "$GITHUB_OUTPUT"
+          echo "reason=non_capacity_failure" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Disparar APPLY do stack
         if: steps.decision.outputs.should_apply == 'true'
