@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: vm-retry
@@ -87,14 +88,45 @@ jobs:
 
           if [ "${STATE:-}" = "RUNNING" ]; then
             echo "A VM já está RUNNING. Nada a fazer."
+
+            INSTANCE_ID=$(echo "$INSTANCE_JSON" | jq -r \
+              --arg NAME "$VM_DISPLAY_NAME" \
+              '.data[] | select(."display-name" == $NAME) | .id' | head -n 1)
+
             echo "should_apply=false" >> "$GITHUB_OUTPUT"
             echo "reason=vm_running" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "A VM ainda não está RUNNING."
           echo "should_apply=check_jobs" >> "$GITHUB_OUTPUT"
           echo "reason=vm_not_running" >> "$GITHUB_OUTPUT"
+
+      - name: Avisar no Telegram e desativar o workflow
+        if: steps.vm_check.outputs.reason == 'vm_running'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INSTANCE_ID: ${{ steps.vm_check.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          PUBLIC_IP=$(oci compute instance list-vnics \
+            --instance-id "$INSTANCE_ID" \
+            --query "data[0].\"public-ip\"" \
+            --raw-output 2>/dev/null || echo "")
+
+          MSG="A VM Oracle subiu! IP publico: ${PUBLIC_IP:-nao disponivel ainda}"
+          echo "$MSG"
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+            --data-urlencode text="$MSG"
+
+          echo "Desativando o workflow (missão cumprida, não precisa mais tentar)..."
+          gh workflow disable vm-retry.yml -R "${{ github.repository }}" || true
 
       - name: Analisar último job da stack
         id: decision
