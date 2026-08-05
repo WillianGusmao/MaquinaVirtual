@@ -157,21 +157,21 @@ jobs:
               ;;
           esac
 
-          echo "Buscando detalhes do último job..."
+          echo "Buscando o log do último job (a mensagem de capacidade só aparece aqui, não em 'job get')..."
           set +e
-          JOB_DETAILS=$(oci resource-manager job get \
+          JOB_LOG=$(oci resource-manager job get-job-logs-content \
             --job-id "$LAST_JOB_ID" \
-            --output json 2>&1)
+            --output json)
           STATUS=$?
           set -e
 
           if [ "$STATUS" -ne 0 ]; then
-            echo "$JOB_DETAILS"
-            echo "::error::Falha ao obter detalhes do último job."
+            echo "$JOB_LOG"
+            echo "::error::Falha ao obter o log do último job."
             exit 1
           fi
 
-          if echo "$JOB_DETAILS" | grep -Ei \
+          if echo "$JOB_LOG" | grep -Ei \
             '(OutOfHostCapacity|out of host capacity|No capacity|insufficient capacity|capacity|sem capacidade|sem espaço|insufficient resources|host capacity)' >/dev/null; then
             echo "Falha por capacidade detectada. Vou reenfileirar o APPLY."
             echo "should_apply=true" >> "$GITHUB_OUTPUT"
