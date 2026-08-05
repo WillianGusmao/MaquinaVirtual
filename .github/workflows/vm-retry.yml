@@ -103,6 +103,29 @@ jobs:
           echo "should_apply=check_jobs" >> "$GITHUB_OUTPUT"
           echo "reason=vm_not_running" >> "$GITHUB_OUTPUT"
 
+      - name: Heartbeat a cada 6h (ainda não subiu)
+        if: steps.vm_check.outputs.reason == 'vm_not_running'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Janelas de 6h em UTC: 00h, 06h, 12h, 18h (= 21h, 03h, 09h, 15h em Brasília, UTC-3).
+          # Janela de 10 min pra tolerar atraso do agendamento do GitHub Actions.
+          HOUR=$((10#$(date -u +%H)))
+          MIN=$((10#$(date -u +%M)))
+
+          if [ $((HOUR % 6)) -eq 0 ] && [ "$MIN" -lt 10 ]; then
+            MSG="Ainda tentando criar a VM Oracle (sem sucesso ate agora - $(date -u '+%Y-%m-%d %H:%M UTC'))."
+            echo "$MSG"
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+              --data-urlencode text="$MSG"
+          else
+            echo "Fora da janela de heartbeat (hora atual UTC: ${HOUR}:${MIN}). Nada a enviar."
+          fi
+
       - name: Avisar no Telegram e desativar o workflow
         if: steps.vm_check.outputs.reason == 'vm_running'
         env:
