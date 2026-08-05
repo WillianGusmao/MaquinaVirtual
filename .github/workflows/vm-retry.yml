@@ -195,7 +195,7 @@ jobs:
           JOB_ID=$(oci resource-manager job create-apply-job \
             --stack-id "$STACK_OCID" \
             --display-name "retry-vm-$(date +%Y%m%d-%H%M%S)" \
-            --operation APPLY \
+            --execution-plan-strategy AUTO_APPROVED \
             --query "data.id" \
             --raw-output)
 
