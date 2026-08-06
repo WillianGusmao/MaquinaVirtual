@@ -1,0 +1,135 @@
+name: Relatorio diario de tentativas da VM
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # 07:00 em Brasilia (UTC-3)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUPPRESS_LABEL_WARNING: "True"
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Instalar OCI CLI e jq
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install oci-cli
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Configurar OCI
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.oci
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+          printf '%b' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
+
+          if ! head -n 1 ~/.oci/oci_api_key.pem | grep -Eq 'BEGIN .*PRIVATE KEY'; then
+            echo "::error::A private key não parece estar em formato PEM válido."
+            exit 1
+          fi
+
+      - name: Montar e enviar relatorio
+        env:
+          STACK_OCID: ${{ secrets.STACK_OCID }}
+          COMPARTMENT_OCID: ${{ secrets.COMPARTMENT_OCID }}
+          VM_DISPLAY_NAME: ${{ secrets.VM_DISPLAY_NAME }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Verifica se a VM ja subiu, so pra dar contexto no relatorio.
+          INSTANCE_JSON=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_OCID" \
+            --all \
+            --output json)
+
+          VM_STATE=$(echo "$INSTANCE_JSON" | jq -r \
+            --arg NAME "$VM_DISPLAY_NAME" \
+            '.data[] | select(."display-name" == $NAME) | ."lifecycle-state"' | head -n 1)
+
+          # Janela: ultimas 24h (equivalente ao "dia" que terminou agora, 07h de hoje).
+          CUTOFF=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S)
+          NOW_LOCAL=$(TZ='America/Sao_Paulo' date '+%d/%m/%Y %H:%M')
+
+          JOBS_JSON=$(oci resource-manager job list \
+            --stack-id "$STACK_OCID" \
+            --all \
+            --output json)
+
+          TIMESTAMPS=$(echo "$JOBS_JSON" | jq -r --arg cutoff "$CUTOFF" '
+            .data[]
+            | select(.operation == "APPLY")
+            | select(."time-created" >= $cutoff)
+            | ."time-created"
+          ')
+
+          declare -A COUNT
+          for h in $(seq -w 0 23); do COUNT["$h"]=0; done
+
+          TOTAL=0
+          while IFS= read -r TS; do
+            [ -z "$TS" ] && continue
+            UTC_HOUR=$(date -u -d "$TS" +%H)
+            LOCAL_HOUR=$(( (10#$UTC_HOUR - 3 + 24) % 24 ))
+            LOCAL_HOUR_STR=$(printf "%02d" "$LOCAL_HOUR")
+            COUNT["$LOCAL_HOUR_STR"]=$(( ${COUNT[$LOCAL_HOUR_STR]:-0} + 1 ))
+            TOTAL=$((TOTAL + 1))
+          done <<< "$TIMESTAMPS"
+
+          AVG=$(awk "BEGIN{printf \"%.1f\", $TOTAL/24}")
+
+          MAX_HOUR="" ; MAX_COUNT=-1
+          MIN_HOUR="" ; MIN_COUNT=999999
+          for h in $(seq -w 0 23); do
+            c=${COUNT[$h]}
+            if [ "$c" -gt "$MAX_COUNT" ]; then MAX_COUNT=$c; MAX_HOUR=$h; fi
+            if [ "$c" -lt "$MIN_COUNT" ]; then MIN_COUNT=$c; MIN_HOUR=$h; fi
+          done
+
+          if [ "$VM_STATE" = "RUNNING" ]; then
+            STATUS_LINE="Status: a VM ja esta RUNNING (sem novas tentativas)."
+          else
+            STATUS_LINE="Status: a VM ainda nao subiu, tentativas continuam a cada 5 min."
+          fi
+
+          MSG="Relatorio diario - tentativas de criar a VM Oracle
+Ate ${NOW_LOCAL} (Brasilia), ultimas 24h
+
+Total de tentativas: ${TOTAL}
+Media por hora: ${AVG}
+Horario com mais tentativas: ${MAX_HOUR}h (${MAX_COUNT})
+Horario com menos tentativas: ${MIN_HOUR}h (${MIN_COUNT})
+
+${STATUS_LINE}"
+
+          echo "$MSG"
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+            --data-urlencode text="$MSG"
