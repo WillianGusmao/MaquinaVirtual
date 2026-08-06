@@ -118,15 +118,8 @@ jobs:
             STATUS_LINE="Status: a VM ainda nao subiu, tentativas continuam a cada 5 min."
           fi
 
-          MSG="Relatorio diario - tentativas de criar a VM Oracle
-Ate ${NOW_LOCAL} (Brasilia), ultimas 24h
-
-Total de tentativas: ${TOTAL}
-Media por hora: ${AVG}
-Horario com mais tentativas: ${MAX_HOUR}h (${MAX_COUNT})
-Horario com menos tentativas: ${MIN_HOUR}h (${MIN_COUNT})
-
-${STATUS_LINE}"
+          MSG=$(printf 'Relatorio diario - tentativas de criar a VM Oracle\nAte %s (Brasilia), ultimas 24h\n\nTotal de tentativas: %s\nMedia por hora: %s\nHorario com mais tentativas: %sh (%s)\nHorario com menos tentativas: %sh (%s)\n\n%s' \
+            "$NOW_LOCAL" "$TOTAL" "$AVG" "$MAX_HOUR" "$MAX_COUNT" "$MIN_HOUR" "$MIN_COUNT" "$STATUS_LINE")
 
           echo "$MSG"
 
