@@ -74,33 +74,42 @@ jobs:
             '.data[] | select(."display-name" == $NAME) | ."lifecycle-state"' | head -n 1)
 
           # Janela: ultimas 24h (equivalente ao "dia" que terminou agora, 07h de hoje).
+          # Brasilia = UTC-3 fixo (sem horario de verao desde 2019); usamos epoch
+          # em vez de TZ=America/Sao_Paulo pra nao depender de tzdata estar instalado no runner.
           CUTOFF=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S)
-          NOW_LOCAL=$(TZ='America/Sao_Paulo' date '+%d/%m/%Y %H:%M')
+          NOW_LOCAL=$(date -u -d "@$(( $(date -u +%s) - 3*3600 ))" '+%d/%m/%Y %H:%M')
 
           JOBS_JSON=$(oci resource-manager job list \
             --stack-id "$STACK_OCID" \
             --all \
             --output json)
 
-          TIMESTAMPS=$(echo "$JOBS_JSON" | jq -r --arg cutoff "$CUTOFF" '
+          # time-created + lifecycle-state de cada tentativa, uma por linha, em ordem cronologica.
+          ROWS=$(echo "$JOBS_JSON" | jq -r --arg cutoff "$CUTOFF" '
             .data[]
             | select(.operation == "APPLY")
             | select(."time-created" >= $cutoff)
-            | ."time-created"
-          ')
+            | [."time-created", ."lifecycle-state"]
+            | @tsv
+          ' | sort)
 
           declare -A COUNT
           for h in $(seq -w 0 23); do COUNT["$h"]=0; done
 
           TOTAL=0
-          while IFS= read -r TS; do
+          LISTING=""
+          while IFS=$'\t' read -r TS STATE; do
             [ -z "$TS" ] && continue
-            UTC_HOUR=$(date -u -d "$TS" +%H)
-            LOCAL_HOUR=$(( (10#$UTC_HOUR - 3 + 24) % 24 ))
-            LOCAL_HOUR_STR=$(printf "%02d" "$LOCAL_HOUR")
+
+            EPOCH=$(date -u -d "$TS" +%s)
+            LOCAL_EPOCH=$((EPOCH - 3*3600))
+            LOCAL_HOUR_STR=$(date -u -d "@$LOCAL_EPOCH" +%H)
             COUNT["$LOCAL_HOUR_STR"]=$(( ${COUNT[$LOCAL_HOUR_STR]:-0} + 1 ))
             TOTAL=$((TOTAL + 1))
-          done <<< "$TIMESTAMPS"
+
+            LOCAL_TS=$(date -u -d "@$LOCAL_EPOCH" '+%d/%m %H:%M')
+            LISTING="${LISTING}${TOTAL}. ${LOCAL_TS} - ${STATE}"$'\n'
+          done <<< "$ROWS"
 
           AVG=$(awk "BEGIN{printf \"%.1f\", $TOTAL/24}")
 
@@ -122,7 +131,31 @@ jobs:
             "$NOW_LOCAL" "$TOTAL" "$AVG" "$MAX_HOUR" "$MAX_COUNT" "$MIN_HOUR" "$MIN_COUNT" "$STATUS_LINE")
 
           echo "$MSG"
+          echo "---"
+          echo "$LISTING"
 
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
-            --data-urlencode text="$MSG"
+          send_telegram() {
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+              --data-urlencode text="$1" > /dev/null
+          }
+
+          send_telegram "$MSG"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            send_telegram "Listagem de tentativas: nenhuma tentativa nas ultimas 24h."
+          else
+            # Telegram limita 4096 caracteres por mensagem; quebra a listagem em blocos seguros.
+            CHUNK=""
+            CHUNK_HEADER="Listagem de tentativas (${TOTAL}):"$'\n'
+            CHUNK="$CHUNK_HEADER"
+            while IFS= read -r LINE; do
+              [ -z "$LINE" ] && continue
+              if [ $(( ${#CHUNK} + ${#LINE} + 1 )) -gt 3500 ]; then
+                send_telegram "$CHUNK"
+                CHUNK=""
+              fi
+              CHUNK="${CHUNK}${LINE}"$'\n'
+            done <<< "$LISTING"
+            [ -n "$CHUNK" ] && send_telegram "$CHUNK"
+          fi
