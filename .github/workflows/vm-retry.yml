@@ -103,28 +103,47 @@ jobs:
           echo "should_apply=check_jobs" >> "$GITHUB_OUTPUT"
           echo "reason=vm_not_running" >> "$GITHUB_OUTPUT"
 
-      - name: Heartbeat a cada 6h (ainda não subiu)
+      - name: Heartbeat as 12h, 18h e 23h em Brasilia (ainda não subiu)
         if: steps.vm_check.outputs.reason == 'vm_not_running'
         env:
+          STACK_OCID: ${{ secrets.STACK_OCID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
 
-          # Janelas de 6h em UTC: 00h, 06h, 12h, 18h (= 21h, 03h, 09h, 15h em Brasília, UTC-3).
-          # Janela de 10 min pra tolerar atraso do agendamento do GitHub Actions.
+          # Checkpoints em Brasilia (UTC-3): 12h, 18h, 23h -> UTC: 15h, 21h, 02h.
+          # O relatorio completo das 7h (vm-daily-report.yml) ja cobre o "6h da manha";
+          # este heartbeat so cobre os outros tres, cada um reportando as tentativas
+          # desde o checkpoint anterior (nao desde o inicio do dia).
+          # Janela de 2h em cada alvo pra tolerar o atraso irregular do schedule do GitHub.
           HOUR=$((10#$(date -u +%H)))
-          MIN=$((10#$(date -u +%M)))
 
-          if [ $((HOUR % 6)) -eq 0 ] && [ "$MIN" -lt 10 ]; then
-            MSG="Ainda tentando criar a VM Oracle (sem sucesso ate agora - $(date -u '+%Y-%m-%d %H:%M UTC'))."
-            echo "$MSG"
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
-              --data-urlencode text="$MSG"
-          else
-            echo "Fora da janela de heartbeat (hora atual UTC: ${HOUR}:${MIN}). Nada a enviar."
+          SINCE_HOUR="" ; CUTOFF_DATE=$(date -u +%Y-%m-%d)
+          case "$HOUR" in
+            15|16) SINCE_HOUR=10 ;;                                   # 12h BR, desde as 7h BR
+            21|22) SINCE_HOUR=15 ;;                                   # 18h BR, desde as 12h BR
+            2|3)   SINCE_HOUR=21 ; CUTOFF_DATE=$(date -u -d 'yesterday' +%Y-%m-%d) ;;  # 23h BR, desde as 18h BR
+          esac
+
+          if [ -z "$SINCE_HOUR" ]; then
+            echo "Fora das janelas de heartbeat (hora atual UTC: ${HOUR}). Nada a enviar."
+            exit 0
           fi
+
+          CUTOFF="${CUTOFF_DATE}T$(printf '%02d' "$SINCE_HOUR"):00:00"
+
+          JOBS_JSON=$(oci resource-manager job list --stack-id "$STACK_OCID" --all --output json)
+          COUNT=$(echo "$JOBS_JSON" | jq -r --arg cutoff "$CUTOFF" '
+            [.data[] | select(.operation == "APPLY") | select(."time-created" >= $cutoff)] | length
+          ')
+
+          MSG="Ainda tentando criar a VM Oracle - ${COUNT} tentativa(s) neste periodo (ate $(date -u '+%H:%M UTC'))."
+          echo "$MSG"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+            --data-urlencode text="$MSG"
+          echo ""
 
       - name: Disparar relatorio diario (~7h em Brasilia)
         if: steps.vm_check.outputs.reason == 'vm_not_running'
