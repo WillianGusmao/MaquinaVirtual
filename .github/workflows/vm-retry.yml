@@ -126,6 +126,34 @@ jobs:
             echo "Fora da janela de heartbeat (hora atual UTC: ${HOUR}:${MIN}). Nada a enviar."
           fi
 
+      - name: Disparar relatorio diario (~7h em Brasilia)
+        if: steps.vm_check.outputs.reason == 'vm_not_running'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # O cron proprio do vm-daily-report.yml (10h UTC) nao vem disparando sozinho
+          # de forma confiavel, entao usamos este workflow - que roda com frequencia
+          # comprovada - como gatilho de apoio. Janela ampla (10h-10h59 UTC = ~7h em
+          # Brasilia) porque os runs deste workflow nao caem sempre perto do minuto 0.
+          HOUR=$((10#$(date -u +%H)))
+
+          if [ "$HOUR" -eq 10 ]; then
+            TODAY=$(date -u +%Y-%m-%d)
+            ALREADY_RAN=$(gh run list -R "${{ github.repository }}" --workflow=vm-daily-report.yml --limit 5 \
+              --json createdAt --jq --arg today "$TODAY" '[.[] | select(.createdAt | startswith($today))] | length')
+
+            if [ "${ALREADY_RAN:-0}" -gt 0 ]; then
+              echo "Relatorio diario ja rodou hoje ($TODAY, $ALREADY_RAN vez(es)). Nao vou disparar de novo."
+            else
+              echo "Dentro da janela do relatorio diario (10h UTC), nenhum run hoje ainda. Disparando..."
+              gh workflow run vm-daily-report.yml -R "${{ github.repository }}" || true
+            fi
+          else
+            echo "Fora da janela do relatorio diario (hora atual UTC: ${HOUR}). Nada a fazer."
+          fi
+
       - name: Avisar no Telegram e desativar o workflow
         if: steps.vm_check.outputs.reason == 'vm_running'
         env:
